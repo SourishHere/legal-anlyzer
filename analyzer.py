@@ -1,12 +1,12 @@
 from pathlib import Path
 import re
-import json
 
 try:
     import pytesseract
     from PIL import Image
 except Exception:
     pytesseract = None
+    Image = None
 
 try:
     import fitz
@@ -17,73 +17,129 @@ DATE_PATTERNS = [
     r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b',
     r'\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}\b',
 ]
-SECTION_RE = re.compile(r'\b(?:Section|Sec\.?|Article)\s*\d+[A-Za-z-]*\b', re.I)
 
 
 def ocr_image(path):
-    if not pytesseract:
+    if not pytesseract or not Image:
         return ""
-    return pytesseract.image_to_string(Image.open(path))
+    try:
+        return pytesseract.image_to_string(Image.open(path))
+    except Exception:
+        return ""
 
 
 def pdf_text(path):
     if not fitz:
         return ""
-    doc = fitz.open(path)
-    return "\n".join(page.get_text() for page in doc)
+    try:
+        doc = fitz.open(path)
+        return "\n".join(page.get_text() for page in doc)
+    except Exception:
+        return ""
 
 
-def extract_dates(text):
+def extract_text(path):
+    return pdf_text(path) if path.suffix.lower() == '.pdf' else ocr_image(path)
+
+
+def dates(text):
     found = []
     for pattern in DATE_PATTERNS:
         found.extend(re.findall(pattern, text, re.I))
     return list(dict.fromkeys(found))
 
 
-def extract_sections(text):
-    return list(dict.fromkeys(SECTION_RE.findall(text)))
+def sentences(text):
+    clean = re.sub(r'\s+', ' ', text).strip()
+    return [x.strip() for x in re.split(r'(?<=[.!?])\s+', clean) if x.strip()]
 
 
-def extract_entities(text):
-    lines = [x.strip() for x in text.splitlines() if x.strip()]
-    people = []
-    for line in lines:
-        if re.search(r'\b(?:vs\.?|versus|v\.)\b', line, re.I):
-            people.append(line[:180])
-    return people[:10]
+def analyze_case(event, files):
+    evidence = []
+    all_text = []
+    all_dates = []
+    for path in files:
+        text = extract_text(path)
+        all_text.append(text)
+        all_dates.extend(dates(text))
+        evidence.append({
+            'file': path.name,
+            'ocr_text': text[:5000],
+            'observations': visual_fallback_observations(path, text),
+            'supports_event': support_score(event, text),
+        })
 
+    combined = ' '.join(all_text)
+    event_lower = event.lower()
+    event_words = set(re.findall(r'[a-z0-9]{4,}', event_lower))
+    evidence_words = set(re.findall(r'[a-z0-9]{4,}', combined.lower()))
+    overlap = sorted(event_words & evidence_words)
+    score = round(100 * len(overlap) / max(len(event_words), 1))
 
-def build_facts(text):
-    sentences = re.split(r'(?<=[.!?])\s+', re.sub(r'\s+', ' ', text).strip())
-    keywords = ('alleged', 'complaint', 'incident', 'injury', 'police', 'court', 'agreement', 'notice', 'payment', 'arrest', 'witness', 'contract', 'appeal')
-    facts = [s for s in sentences if any(k in s.lower() for k in keywords)]
-    return facts[:12]
+    supporting = [e['file'] for e in evidence if e['supports_event'] >= 40]
+    weak = [e['file'] for e in evidence if e['supports_event'] < 40]
+    missing = []
+    for concept, words in {
+        'time': {'time', 'pm', 'am', 'oclock', 'morning', 'evening', 'night'},
+        'location': {'near', 'road', 'street', 'gate', 'college', 'address'},
+        'person/party': {'driver', 'victim', 'person', 'witness', 'owner'},
+    }.items():
+        if any(w in event_lower for w in words) and not any(w in combined.lower() for w in words):
+            missing.append(f'{concept} is claimed in the event but not verified in the uploaded evidence.')
 
-
-def analyze_file(path):
-    ext = path.suffix.lower()
-    text = pdf_text(path) if ext == '.pdf' else ocr_image(path)
-    dates = extract_dates(text)
-    sections = extract_sections(text)
-    facts = build_facts(text)
-    warnings = []
-    if not text.strip():
-        warnings.append('No readable text was detected. Try a clearer image or scanned PDF.')
-    if len(text.strip()) < 80:
-        warnings.append('Only a small amount of text was extracted; visual/legal conclusions may be incomplete.')
     return {
-        'filename': path.name,
-        'status': 'success' if text.strip() else 'warning',
-        'extracted_text': text[:12000],
-        'facts': facts,
-        'dates': dates,
-        'legal_references': sections,
-        'possible_parties': extract_entities(text),
-        'image_observations': [
-            'OCR completed on the uploaded visual document.',
-            'For photographs/evidence, visual-object analysis is enabled when a multimodal provider is configured.'
-        ],
+        'status': 'success',
+        'event_description': event,
+        'event_match_score': score,
+        'event_match_summary': match_summary(score),
+        'supported_claims': supporting,
+        'unverified_or_weak_evidence': weak,
+        'missing_verification': missing,
+        'evidence': evidence,
+        'dates': list(dict.fromkeys(all_dates)),
+        'facts_from_evidence': evidence_facts(combined),
         'contradictions': [],
-        'analysis': 'This MVP separates extracted evidence from legal interpretation. Add a multimodal model/API key for deeper image and fact reasoning.',
-        'warnings': warnings,
+        'case_analysis': build_analysis(event, evidence, score, missing),
+        'extracted_text': combined[:12000],
+        'warnings': [
+            'Visual observations are conservative in the no-AI-provider mode. Configure a vision model for object, scene and damage recognition.'
+        ],
     }
+
+
+def support_score(event, text):
+    ew = set(re.findall(r'[a-z0-9]{4,}', event.lower()))
+    tw = set(re.findall(r'[a-z0-9]{4,}', text.lower()))
+    return round(100 * len(ew & tw) / max(len(ew), 1))
+
+
+def match_summary(score):
+    if score >= 65:
+        return 'Strong textual overlap between the event description and extracted evidence.'
+    if score >= 35:
+        return 'Some parts of the event are supported by the evidence, but verification is incomplete.'
+    return 'The uploaded evidence provides limited textual support for the event description.'
+
+
+def evidence_facts(text):
+    keywords = ('incident', 'accident', 'injury', 'damage', 'vehicle', 'witness', 'police', 'payment', 'message', 'complaint', 'occurred', 'happened')
+    return [s for s in sentences(text) if any(k in s.lower() for k in keywords)][:15]
+
+
+def visual_fallback_observations(path, text):
+    obs = [f'Evidence file received: {path.name}.']
+    if text.strip():
+        obs.append('Readable text was extracted from this evidence.')
+    else:
+        obs.append('No reliable text was detected. A vision model is required for meaningful scene/object analysis.')
+    return obs
+
+
+def build_analysis(event, evidence, score, missing):
+    lines = [f'Event described: {event}', f'Initial evidence-to-event match: {score}/100.']
+    if evidence:
+        lines.append(f'{len(evidence)} evidence file(s) were processed.')
+    if missing:
+        lines.append('Verification gaps: ' + ' '.join(missing))
+    lines.append('Important: this is evidence analysis, not a final legal conclusion. Facts should be verified against the original evidence and applicable law.')
+    return ' '.join(lines)
